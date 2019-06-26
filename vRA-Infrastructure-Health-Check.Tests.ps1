@@ -3,7 +3,7 @@
   Run Pester test health checks across the vRA infrastructure.
 .DESCRIPTION
   Test all the individual components that make up and support the vRA 
-  infrastructure. From simple pings, to checking event logs and services.
+  infrastructure. From simply pings, to checking event logs and services.
 .PARAMETER CredMgmt
   The Management domain credentials to use to connect to vCenter, vRA, IaaS
 .PARAMETER JSONPayload
@@ -15,7 +15,6 @@
   We are not using PowervRO or PowervRA modules as they are not supported by
   VMware.  Pester is also not supported by VMware, but is being used as the testing 
   framework.
-  
 #>
 #requires -Modules Pester, VMware.VIM
 [CmdletBinding()]
@@ -33,13 +32,13 @@ Write-Verbose "[INFO] Starting $($MyInvocation.MyCommand.Name)"
 #region --- environment setup -------------------------------------------------
 
 #Uncomment one or more of these parameters to skip past tests. Mainly for testing purposes.
-$skipICMP = $true
+#$skipICMP = $true
 #$skipvCenter = $true
 #$skipvRA = $true
 #$skipvRO = $true
 #$skipIaaSMgr = $true
 #$skipIaaSWeb = $true
-#$skipTemplate = $true
+$skipTemplate = $true
 
 #Get the DNS domain for where this test script is being run from
 $testerDomain = (Get-WmiObject win32_computersystem).Domain
@@ -49,7 +48,6 @@ $testerDomain = (Get-WmiObject win32_computersystem).Domain
 #hack work around to get sub section of json into an Object for easier use
 $serverList = $jsonData | ConvertFrom-Json | Select -ExpandProperty Server | ConvertTo-Json -Depth 5 | ConvertFrom-Json
 $serviceList = $jsonData | ConvertFrom-Json | Select -ExpandProperty Service | ConvertTo-Json -Depth 5 | ConvertFrom-Json
-$vRAEndpointList = $jsonData | ConvertFrom-Json | Select -ExpandProperty vRAEndpoint | ConvertTo-Json -Depth 5 | ConvertFrom-Json
 $templateList = $jsonData | ConvertFrom-Json | Select -ExpandProperty Template | ConvertTo-Json -Depth 5 | ConvertFrom-Json
 
 <#
@@ -59,8 +57,6 @@ clear text passwords
 #>
 $mgmtUsername = $CredMgmt.UserName
 $mgmtPassword = $CredMgmt.GetNetworkCredential().Password
-
-
 
 #endregion --- environment setup ----------------------------------------------
 
@@ -114,7 +110,9 @@ if($skipICMP) {
                 }#end it
 
                 #can only test in the domain this test script is run from
-                if ($dnsDomain -eq $testerDomain)
+                #if ($dnsDomain -eq $testerDomain)
+                #exlcude vmwarevmc.com as reverse lookup to vCenter in VMC will not work.
+                if ($dnsDomain -notmatch "vmwarevmc.com")
                 {
 
                     it 'IP Address resolves to hostname' {
@@ -136,7 +134,7 @@ if($skipICMP) {
             $svcPort = $service.Port
             $svcApi = $service.api
 
-            Context "$($svcType) $($fqdn) ($($dataCenter))" {
+            Context "$($svcType) $($svcFQDN)" {
 
                 it 'Service name should respond to ICMP packets (ping)' {
                     Test-Connection -ComputerName $svcFQDN -Quiet | should Be $true
@@ -224,12 +222,21 @@ if($skipvCenter)
 
 #region --- vRA ---------------------------------------------------------------
 
-if ($skipTemplate)
+if ($skipvRA)
 {
     Write-Verbose "[INFO] Skipping: vRA"
 } else {
 
-    #Place any specific region setup here
+    <#
+    vRA 7.x requires tls 1.2 to work, otherwise will receive the error:
+    Invoke-RestMethod : The underlying connection was closed: An unexpected error occurred on a send.
+    when attempting to do Invoke-restmethod
+    #>
+    if (-not ("Tls12" -in  (([System.Net.ServicePointManager]::SecurityProtocol).ToString() -split ", ")))
+    {
+        Write-Verbose "[INFO] Adding Tls 1.2 to security protocol"
+        [System.Net.ServicePointManager]::SecurityProtocol += [System.Net.SecurityProtocolType]::Tls12
+    }#end if tls12
 
     Describe 'vRA Tests' {
 
@@ -239,30 +246,153 @@ if ($skipTemplate)
             $vraFQDN = $service.FQDN
             $vraPort = $service.Port
             $vraApi = $service.api
+            $vamiPort = $service.vamiPort
+            $tenant = $service.tenant
             $uri = $null
             $result = $null
 
-            Context "Context" {
+            <#
+            Health of vRA 
+            docs.vmware.com  "Support for Monitoring health for a HA Enabled vRealize Automation"
 
-                it 'Health Status' {
+            vRealize Automation Server            /vcac
+            vRealize Automation Manager Server    /vco
+            #>
+
+            Context "Web page tests" {
+                
+                it 'Health Status url loads without error' {
                     $uri = "https://$($vraFQDN)$($vraApi)/vcac/services/api/status"
-                    #https://$($vraFQDN)/component-registry/services/status/current
-                    #returns an xml document
                     $result = Invoke-WebRequest -Uri $uri
 
-                    #$result.somthing | should be OK? \ REGISTERED
+                    $result.StatusCode | Should Be "200"
 
                 }#end it
+
+                it 'Health Status is REGISTERED' {
+                    $uri = "https://$($vraFQDN)$($vraApi)/vcac/services/api/status"
+                    $result = Invoke-WebRequest -Uri $uri
+
+                    ($result.Content | ConvertFrom-Json).serviceInitializationStatus | Should Be "REGISTERED"
+
+                }#end it
+
+
+                it 'VAMI Login page loads without error' {
+                    $uri = "https://$($vraFQDN):$($vamiPort)"
+                    $result = Invoke-WebRequest -Uri $uri
+
+                    $result.StatusCode | Should Be "200"
+
+                }
                 
-                it 'Create valid access token' {
-                    
+                it 'vRA Login GUI Page Loads without error' {
+                    $uri = "https://$($vraFQDN)/vcac"
+                    $result = Invoke-WebRequest -Uri $uri
 
+                    $result.StatusCode | Should Be "200"
 
                 }#end it
 
+            }#end context Web Pages
+
+            Context "REST API" {
+
+                #region --- generate token for vRA REST requests ------------------------------
+                #Must be outside the 'it' as this is a scope and we need to use the token in other tests
+
+                $method = "POST"
+                $uri = "https://$($vraFQDN)/identity/api/tokens"
+
+                $headers = New-Object "System.Collections.Generic.Dictionary[[String],[String]]"
+                $headers.Add("Accept", 'application/json')
+                $headers.Add("Content-Type", 'application/json')
+
+                $body = @{
+                    username = $mgmtUsername
+                    password = $mgmtPassword
+                    tenant = $tenant
+                } | ConvertTo-Json
 
 
+                $response = $null
+
+                try
+                {
+                    $response = Invoke-RestMethod -Uri $uri -Method $method -Headers $headers -Body $body
+                }
+                catch 
+                {
+                    Write-Output "StatusCode:" $_.Exception.Response.StatusCode.value__
+                    throw
+                }
+                $vraToken = $response
+                $bearer_token = $vraToken.id
+
+                #endregion --- generate token for vRA REST requests ---------------------------
+
+
+                it 'Creates a valid access token' {
+                    $vraToken | Should Be $true
+                }#end it
+
+
+                #region --- Validate all configured Endpoints ---------------------------------
+
+                #Get all Endpoints
+                $uri = "https://$($vraServer)/endpoint-configuration-service/api/endpoints?limit=1000"
+                $method = "GET"
+
+                $headers = New-Object "System.Collections.Generic.Dictionary[[String],[String]]"
+                $headers.Add("Accept", 'application/json')
+                $headers.Add("Content-Type", 'application/json')
+                $headers.Add("Authorization", "Bearer $($bearer_token)")
+
+                try
+                {
+                    $response = Invoke-RestMethod -Uri $uri -Method $method -Headers $headers
+                }
+                catch 
+                {
+                    Write-Output "StatusCode: $($_.Exception.Response.StatusCode.value__)"
+                    throw
+                }
+
+                $endpointList = $response.content
+                Write-Output "[INFO] Total vRA Endpoints: $($endpointList.Count)"
+
+                #uri to validate the endpoint connection
+                $method = "POST"
+                $uri = "https://$($vraServer)/endpoint-configuration-service/api/endpoints/validate"
+
+                foreach ($endpoint in $endpointList)
+                {
+                    $epJSON = $endpoint | ConvertTo-Json -Depth 5
+                    $response = $null
+                    try
+                    {
+                        $response = Invoke-RestMethod -Uri $uri -Method $method -Headers $headers -Body $epJSON
+                    }
+                    catch 
+                    {
+                        Write-Output "StatusCode: $($_.Exception.Response.StatusCode.value__)"
+                        throw
+                    }
+                    
+                    it "Endpoint [$($endpoint.name)] validation is successful." {
+                        $($response.status) | Should Be "SUCCESS"
+                    }#end it
+
+                }#end foreach endpoint
+
+
+                #endregion --- Validate all configured Endpoints ------------------------------
+
+            }#end Context REST API
+
+            Context 'Other Test Ideas' {
                 it 'Infrastructure -> Monitoring -> DEM Status' {
+
 
                 }#end it
 
@@ -283,25 +413,18 @@ if ($skipTemplate)
                 }#end it
 
                 it 'Infrastructure -> Compute Resource -> Compute Resource' {
-
-
-                }#end it
-
-                it 'Test endpoint connection to each of the vCenter server endpoints' {
-
+                    
 
                 }#end it
+
+
 
                 it 'Do a test deployment of each IaaS to each vCenter. Red Hat, 2012 R2 and 2016' {
 
 
                 }#end it
 
-                it 'disconnect test?' {
-
-                }#end it
-
-            }#end Context    
+            }#end Context Other Test Ideas
 
         }#End foreach vRO
 
@@ -387,6 +510,15 @@ if ($skipvRO)
                     
                 }#end it
 
+                it 'vRO Links Page Loads without error' {
+                    $uri = "https://$($vroFQDN)/vco"
+                    $result = Invoke-WebRequest -Uri $uri
+
+                    $result.StatusCode | Should Be "200"
+
+                }#end it
+
+
             }#end Context    
 
         }#End foreach vRO
@@ -400,7 +532,11 @@ if ($skipvRO)
 
 #region --- IaaS Manager ------------------------------------------------------
 
-#Status uri?  : /VMPS2   or  /VMPS2/Provision
+<#
+Health of vRA 
+docs.vmware.com  "Support for Monitoring health for a HA Enabled vRealize Automation"
+
+#>
 
 if ($skipIaaSMgr)
 {
@@ -411,18 +547,43 @@ if ($skipIaaSMgr)
 
     Describe 'IaaS Manager Tests' {
 
+        foreach ($service in ($serviceList | ? { $_.type -eq "IaaSMgr" })) {
+
+            $fqdn = "$($service.FQDN)"
+            $healthAPI = "$($service.healthAPI)"
+
+            Context "Health Status" {
+                $uri = "https://$($fqdn)$($healthAPI)"
+                $result = Invoke-WebRequest -Uri $uri -Credential $CredMgmt
+
+                it 'IaaS Manager' {
+                    $result.StatusCode | Should Be "200"
+                }#end it
+
+                #Not sure if we need this just yet. As cannot see anything in the content to suggest successful
+                #above a 200 status return
+                #$xml = $result.rawcontent.Substring($result.RawContent.IndexOf("<?xml")) | ConvertTo-Xml
+
+            }#end Context
+
+        }#End foreach
+
         foreach ($server in ($serverList | ? { $_.type -eq "IaaSMgr" })) {
 
             $fqdn = "$($server.Hostname).$($server.DNSDomain)"
 
-            Context "Services" {
+            <#
+                this will require WinRM from the location of this test to each
+                of the Windows servers that are in the list
+            #>
+            Context "Windows Services - $($server.Hostname)" {
                 
-                #NOTE: Not going to work unless WinRM connectivity available?
+                #NOTE: Not going to work unless WinRM connectivity available
                 #$result = Get-Service -Name "VMware*" -ComputerName $fqdn
 
-                foreach ($service in $result)
+                foreach ($winService in $result)
                 {
-                    it "$($service.name) is running" {
+                    it "$($winService.name) is running" {
                         #$service.State | should Be "Running"
 
                     }#end it
@@ -430,7 +591,6 @@ if ($skipIaaSMgr)
                 }#end foreach
 
                 $result = $null
-
             }#end Context    
 
         }#End foreach
@@ -444,9 +604,16 @@ if ($skipIaaSMgr)
 
 #region --- IaaS Web ----------------------------------------------------------
 
-#status uri?  : /WAPI/api/status   or   /WAPI/api/status/Web
+<#
+Health of vRA 
+docs.vmware.com  "Support for Monitoring health for a HA Enabled vRealize Automation"
 
-#repository:  /Repository/Data/MetaModel.svc
+vRealize Orchestrator App Server      /WAPI/api/status
+
+#Requires authentication
+repository:  /Repository/Data/MetaModel.svc
+#>
+
 
 if ($skipIaaSWeb)
 {
@@ -457,18 +624,42 @@ if ($skipIaaSWeb)
 
     Describe 'IaaS Web Tests' {
 
+
+        foreach ($service in ($serviceList | ? { $_.type -eq "IaaSWeb" })) {
+
+            $fqdn = "$($service.FQDN)"
+            $healthAPI = "$($service.healthAPI)"
+
+            Context "Health Status" {
+
+                it 'Health Status is registerd' {
+                    $uri = "https://$($fqdn)$($healthAPI)"
+                    $result = Invoke-WebRequest -Uri $uri
+
+                    ($result.Content | ConvertFrom-Json).serviceInitializationStatus | Should Be "REGISTERED"
+
+                }#end it
+
+            }#end Context
+
+        }#end foreach
+
         foreach ($server in ($serverList | ? { $_.type -eq "IaaSWeb" })) {
 
             $fqdn = "$($server.Hostname).$($server.DNSDomain)"
 
-            Context "Services" {
+            <#
+                this will require WinRM from the location of this test to each
+                of the Windows servers that are in the list
+            #>
+            Context "Windows Services - $($server.Hostname)" {
                 
                 #NOTE: Not going to work unless WinRM connectivity available?
                 #$result = Get-Service -Name "VMware*" -ComputerName $fqdn
 
-                foreach ($service in $result)
+                foreach ($winService in $result)
                 {
-                    it "$($service.name) is running" {
+                    it "$($winService.name) is running" {
                         #$service.State | should Be "Running"
 
                     }#end it
@@ -476,7 +667,6 @@ if ($skipIaaSWeb)
                 }#end foreach
 
                 $result = $null
-
             }#end Context    
 
         }#End foreach
