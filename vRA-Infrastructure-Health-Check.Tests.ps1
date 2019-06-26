@@ -11,8 +11,30 @@
   The tests are tightly related to the json structure but by keeping them 
   separate they can be edited independently from the tests themselves. Reducing
   fat fingering of scripts.
+.PARAMETER ICMP
+  Enable ICMP (ping) tests, default is true. Currently only tested using ICMPv4
+  ICMP pings all Servers and Services
+.PARAMETER vCenter
+  Enable tests for vCenter, default is false
+.PARAMETER vRA
+  Enable tests for vRealize Automation, default is false
+.PARAMETER vRAIaaS
+  Enable tests for vRealize Automation IaaS Manager and Web Windows servers, default is false
+.PARAMETER vRO
+  Enable tests for vRealize Orchestrator, default is false
+.PARAMETER LogInsight
+  Enable tests, default is false
+.PARAMETER NSXT
+  Enable tests, default is false
+.PARAMETER vRNI
+  Enable tests for vRealize Network Insight, default is false
+.INPUTS
+  [Management.Automation.PSCredential]
+  [string]
+  [switch]
 .NOTES
-  We are not using PowervRO or PowervRA modules as they are not supported by
+  Author: Clint Fritz
+  Note: Not using PowervRO or PowervRA modules as they are not supported by
   VMware.  Pester is also not supported by VMware, but is being used as the testing 
   framework.
 #>
@@ -24,21 +46,28 @@ Param
     [Parameter(Mandatory=$true)]
     [Management.Automation.PSCredential]$CredMgmt,
     [Parameter(Mandatory=$true)]
-    [string]$JSONPayload
+    [string]$JSONPayload,
+    [Parameter(Mandatory=$false)]
+    [switch]$ICMP=$true,
+    [Parameter(Mandatory=$false)]
+    [switch]$vCenter=$false,
+    [Parameter(Mandatory=$false)]
+    [switch]$vRA=$false,
+    [Parameter(Mandatory=$false)]
+    [switch]$vRAIaaS=$false,
+    [Parameter(Mandatory=$false)]
+    [switch]$vRO=$false,
+    [Parameter(Mandatory=$false)]
+    [switch]$LogInsight=$false,
+    [Parameter(Mandatory=$false)]
+    [switch]$NSXT=$false,
+    [Parameter(Mandatory=$false)]
+    [switch]$vRNI=$false
 )#end Param
 
 Write-Verbose "[INFO] Starting $($MyInvocation.MyCommand.Name)"
 
 #region --- environment setup -------------------------------------------------
-
-#Uncomment one or more of these parameters to skip past tests. Mainly for testing purposes.
-#$skipICMP = $true
-#$skipvCenter = $true
-#$skipvRA = $true
-#$skipvRO = $true
-#$skipIaaSMgr = $true
-#$skipIaaSWeb = $true
-$skipTemplate = $true
 
 #Get the DNS domain for where this test script is being run from
 $testerDomain = (Get-WmiObject win32_computersystem).Domain
@@ -62,9 +91,7 @@ $mgmtPassword = $CredMgmt.GetNetworkCredential().Password
 
 
 #region --- ICMP and Name resolution ---------------------------------------------
-if($skipICMP) {
-    Write-Verbose "[INFO] Skipping: ICMP and Name resolution"
-} else {
+if($ICMP) {
 
     Write-Verbose "[INFO] ICMP and Name resolution"
 
@@ -146,16 +173,16 @@ if($skipICMP) {
 
     }#end describe block
 
+} else {
+    Write-Verbose "[INFO] Skipping: ICMP and Name resolution"
 }#end if skipPing
 
 #endregion --- ICMP and Name resolution ---------------------------------------
 
 
 #region --- vCenter -----------------------------------------------------------
-if($skipvCenter)
+if($vCenter)
 {
-    Write-Verbose "[INFO] Skipping: vCenter tests"
-} else {
     Describe 'vCenter Tests' {
         foreach ($server in $serverList | ? { $_.type -eq "vCenter"} )
         {
@@ -215,6 +242,9 @@ if($skipvCenter)
 
     }#end Describe
 
+} else {
+    Write-Verbose "[INFO] Skipping: vCenter tests"
+
 }#end if skip
 
 #endregion --- vCenter --------------------------------------------------------
@@ -222,11 +252,8 @@ if($skipvCenter)
 
 #region --- vRA ---------------------------------------------------------------
 
-if ($skipvRA)
+if ($vRA)
 {
-    Write-Verbose "[INFO] Skipping: vRA"
-} else {
-
     <#
     vRA 7.x requires tls 1.2 to work, otherwise will receive the error:
     Invoke-RestMethod : The underlying connection was closed: An unexpected error occurred on a send.
@@ -429,6 +456,8 @@ if ($skipvRA)
         }#End foreach vRO
 
     }#end Describe
+} else {
+    Write-Verbose "[INFO] Skipping: vRA"
 
 } #end if skip
 
@@ -436,11 +465,8 @@ if ($skipvRA)
 
 
 #region --- vRO ------------------------------------------------------------
-if ($skipvRO)
+if ($vRO)
 {
-    Write-Verbose "[INFO] Skipping: vRO tests"
-} else {
-
     <#
     vRO 7.x requires tls 1.2 to work, otherwise will receive the error:
     Invoke-RestMethod : The underlying connection was closed: An unexpected error occurred on a send.
@@ -508,6 +534,12 @@ if ($skipvRO)
                           <attribute value="ENDPOINT--https___vcenter.corp.local.au_api" name="name"/>
                     #>
                     
+                    <#
+                      Run a workflow that does a search of each of the AD configurations?
+                      This would confirm the configuration itself is correct and that vRO 
+                      can connect to it to be able to do a simply search and retrieve info.
+                    #>
+
                 }#end it
 
                 it 'vRO Links Page Loads without error' {
@@ -525,12 +557,15 @@ if ($skipvRO)
 
     }#end Describe
 
+} else {
+    Write-Verbose "[INFO] Skipping: vRO tests"
+
 } #end if skip
 
 #endregion --- vRO ------------------------------------------------------------
 
 
-#region --- IaaS Manager ------------------------------------------------------
+#region --- vRA IaaS Manager --------------------------------------------------
 
 <#
 Health of vRA 
@@ -538,10 +573,8 @@ docs.vmware.com  "Support for Monitoring health for a HA Enabled vRealize Automa
 
 #>
 
-if ($skipIaaSMgr)
+if ($vRAIaaS)
 {
-    Write-Verbose "[INFO] Skipping: IaaS Manager"
-} else {
 
     #Place any specific region setup here
 
@@ -597,28 +630,16 @@ if ($skipIaaSMgr)
 
     }#end Describe
 
-} #end if skip
+    <#
+    Health of vRA 
+    docs.vmware.com  "Support for Monitoring health for a HA Enabled vRealize Automation"
 
-#endregion --- IaaS Manager ---------------------------------------------------
+    vRealize Orchestrator App Server      /WAPI/api/status
 
+    #Requires authentication
+    repository:  /Repository/Data/MetaModel.svc
+    #>
 
-#region --- IaaS Web ----------------------------------------------------------
-
-<#
-Health of vRA 
-docs.vmware.com  "Support for Monitoring health for a HA Enabled vRealize Automation"
-
-vRealize Orchestrator App Server      /WAPI/api/status
-
-#Requires authentication
-repository:  /Repository/Data/MetaModel.svc
-#>
-
-
-if ($skipIaaSWeb)
-{
-    Write-Verbose "[INFO] Skipping: IaaS Web"
-} else {
 
     #Place any specific region setup here
 
@@ -673,17 +694,24 @@ if ($skipIaaSWeb)
 
     }#end Describe
 
+
+} else {
+    Write-Verbose "[INFO] Skipping: vRA IaaS"
+
 } #end if skip
 
-#endregion --- IaaS Web -------------------------------------------------------
+#endregion --- vRA IaaS ---------------------------------------------------
+
 
 
 #region --- Template ----------------------------------------------------------
+<#
+This is a template region to be used to copy when creating new blocks of tests.
+When adding a new section, add a new switch parameter
+#>
 
-if ($skipTemplate)
+if ($templateType)
 {
-    Write-Verbose "[INFO] Skipping: Template"
-} else {
 
     #Place any specific region setup here
 
@@ -702,6 +730,9 @@ if ($skipTemplate)
         }#End foreach
 
     }#end Describe
+
+} else {
+    Write-Verbose "[INFO] Skipping: Template"
 
 } #end if skip
 
