@@ -227,6 +227,11 @@ $Params = @{
     #myVar = "myValue";
     CredMgmt = $credMgmt;
     JSONPayload = $jsonData;
+    ICMP = $true;
+    vCenter = $true;
+    vRA = $true;
+    vRO = $true;
+    vRAIaaS = $true;
 }
 
 #To save the result as an NUnit file add the following :  -OutputFile $pesterOutput -OutputFormat NUnitXml 
@@ -237,7 +242,51 @@ $VerbosePreference = "SilentlyContinue"
 Return
 <#
 
-Services that should be running on a functioning vRA 7.5 system.
+Service JSON Template
+        {
+            "Type": "",
+            "FQDN": "",
+            "Port": "",
+            "api": "",
+            "vamiPort": "",
+            "tenant": ""
+        },
+
+Service designed for load balanced systems or points of entry.
+Could add IP address, however some environments do not do reverse look
+ups for load balancers. could be added as another item and if IP Address
+is set, then test it. If not then skip it.
+tenant is only used by vRA at this point.
+
+
+Server JSON template
+
+            {
+                "Type":  "",
+                "Hostname":  "",
+                "DNSDomain":  "myac.gov.au",
+                "IPAddress":  "10.",
+                "DataCenter": ""
+            }
+
+vCenter template template
+
+        {
+            "Type": "",
+            "OS": "",
+            "Name": "<name of template>"
+        }
+
+Break out template into new section? ie out of vCenter?
+as not all environments will be replicating to all vCenters?
+Possibly add an optional vCenter value. if set then only check
+this vCenter. Or may have to be an array of vCenters.
+
+#>
+
+<#
+
+Services that should be running on a functioning VCSA 6.5 
 
 Command> shell
 Shell access is granted to root
