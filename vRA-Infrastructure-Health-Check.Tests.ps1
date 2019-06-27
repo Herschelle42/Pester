@@ -4,8 +4,8 @@
 .DESCRIPTION
   Test all the individual components that make up and support the vRA 
   infrastructure. From simply pings, to checking event logs and services.
-.PARAMETER CredMgmt
-  The Management domain credentials to use to connect to vCenter, vRA, IaaS
+.PARAMETER Credential
+  The Credentials with rights to vCenter, vRA, vRO.
 .PARAMETER JSONPayload
   Data to be used in these tests, rather than creating dozens of parameters.
   The tests are tightly related to the json structure but by keeping them 
@@ -28,6 +28,8 @@
   Enable tests, default is false
 .PARAMETER vRNI
   Enable tests for vRealize Network Insight, default is false
+.PARAMETER vIDM
+  Enable tests for VMware Identity Manager, default is false
 .INPUTS
   [Management.Automation.PSCredential]
   [string]
@@ -44,7 +46,7 @@ Param
 (
    
     [Parameter(Mandatory=$true)]
-    [Management.Automation.PSCredential]$CredMgmt,
+    [Management.Automation.PSCredential]$Credential,
     [Parameter(Mandatory=$true)]
     [string]$JSONPayload,
     [Parameter(Mandatory=$false)]
@@ -62,7 +64,9 @@ Param
     [Parameter(Mandatory=$false)]
     [switch]$NSXT=$false,
     [Parameter(Mandatory=$false)]
-    [switch]$vRNI=$false
+    [switch]$vRNI=$false,
+    [Parameter(Mandatory=$false)]
+    [switch]$vIDM=$false
 )#end Param
 
 Write-Verbose "[INFO] Starting $($MyInvocation.MyCommand.Name)"
@@ -72,22 +76,62 @@ Write-Verbose "[INFO] Starting $($MyInvocation.MyCommand.Name)"
 #Get the DNS domain for where this test script is being run from
 $testerDomain = (Get-WmiObject win32_computersystem).Domain
 
-#Get the list of servers to test and convert to a Powershell Object
-#$serverList = $JSONPayload | ConvertFrom-Json
-#hack work around to get sub section of json into an Object for easier use
-$serverList = $jsonData | ConvertFrom-Json | Select -ExpandProperty Server | ConvertTo-Json -Depth 5 | ConvertFrom-Json
-$serviceList = $jsonData | ConvertFrom-Json | Select -ExpandProperty Service | ConvertTo-Json -Depth 5 | ConvertFrom-Json
-$templateList = $jsonData | ConvertFrom-Json | Select -ExpandProperty Template | ConvertTo-Json -Depth 5 | ConvertFrom-Json
+#Convert jsonData to PSObject for easier manipulation
+$payload = $JSONPayload | ConvertFrom-Json
+
+#hack work around to get sub section of json into Objects for easier use
+if ($payload.Server) 
+{
+    $serverList = $payload | Select -ExpandProperty Server | ConvertTo-Json -Depth 5 | ConvertFrom-Json
+} else {
+    Write-Verbose "[INFO] No Server property found in json payload"
+}
+if ($payload.Service)
+{
+    $serviceList = $payload | Select -ExpandProperty Service | ConvertTo-Json -Depth 5 | ConvertFrom-Json
+} else {
+    Write-Verbose "[INFO] No Service property found in json payload"
+}
+if ($payload.Template)
+{
+    $templateList = $payload | Select -ExpandProperty Template | ConvertTo-Json -Depth 5 | ConvertFrom-Json
+} else {
+    Write-Verbose "[INFO] No Template property found in json payload"
+}
 
 <#
 Split out the password from the credential as this is required to perfrom the 
 REST requests. Where possible should always use a Credential rather than
 clear text passwords
 #>
-$mgmtUsername = $CredMgmt.UserName
-$mgmtPassword = $CredMgmt.GetNetworkCredential().Password
+$Username = $Credential.UserName
+$Password = $Credential.GetNetworkCredential().Password
 
 #endregion --- environment setup ----------------------------------------------
+
+
+#region --- internal functions ------------------------------------------------
+
+function intSkip-CertificateCheck
+{
+
+add-type @"
+using System.Net;
+using System.Security.Cryptography.X509Certificates;
+public class TrustAllCertsPolicy : ICertificatePolicy {
+    public bool CheckValidationResult(
+        ServicePoint srvPoint, X509Certificate certificate,
+        WebRequest request, int certificateProblem) {
+        return true;
+    }
+}
+"@
+    #$AllProtocols = [System.Net.SecurityProtocolType]'Ssl3,Tls,Tls11,Tls12'
+    #[System.Net.ServicePointManager]::SecurityProtocol = $AllProtocols
+    [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
+
+}
+#endregion --- internal functions ---------------------------------------------
 
 
 #region --- ICMP and Name resolution ---------------------------------------------
@@ -101,6 +145,14 @@ if($ICMP) {
 
         foreach ($server in $serverList)
         {
+            #Clear all variables to ensure clean state
+            $computerName = $null
+            $fqdn = $null
+            $ipAddress = $null
+            $type = $null
+            $dataCenter = $null
+            $dnsDomain = $null
+
             #avoiding the use of $hostname
             $computerName = $server.Hostname
             $fqdn = "$($server.Hostname).$($server.DNSDomain)"
@@ -126,27 +178,40 @@ if($ICMP) {
             }#end context mock test
             #>
 
-            Context "$($type) $($fqdn) ($($dataCenter))" {
-                it 'FQDN should respond to ICMP packets (ping)' {
+            Context "$($type) $($fqdn)" {
+
+                it 'FQDN responds to ICMP packets (ping)' {
                     Test-Connection -ComputerName $fqdn -Quiet | should be $true
                 }#end it
 
-
-                it 'IP Address should respond to ICMP packets (ping)' {
-                    Test-Connection -ComputerName $($ipAddress) -Quiet | should be $true
-                }#end it
-
-                #can only test in the domain this test script is run from
-                #if ($dnsDomain -eq $testerDomain)
-                #exlcude vmwarevmc.com as reverse lookup to vCenter in VMC will not work.
-                if ($dnsDomain -notmatch "vmwarevmc.com")
+                #If no IP Address specified in the payload
+                if($ipAddress)
                 {
-
-                    it 'IP Address resolves to hostname' {
-                        #Test-Connection -ComputerName $($ipAddress) -Quiet | should be $computerName
-                        [System.Net.Dns]::GetHostEntry($ipaddress).HostName | should Be $fqdn
-
+                    it 'IP Address returned from fqdn matches IP address provided' {
+                        (Test-Connection -ComputerName $fqdn -Count 1).IPV4Address | Should Be $ipAddress
                     }#end it
+
+                    it 'IP Address responds to ICMP packets (ping)' {
+                        Test-Connection -ComputerName $($ipAddress) -Quiet | should be $true
+                    }#end it
+
+                    #can only test in the domain this test script is run from
+                    #if ($dnsDomain -eq $testerDomain)
+                    #exlcude vmwarevmc.com as reverse lookup to vCenter in VMC will not work.
+                    if ($dnsDomain -notmatch "vmwarevmc.com")
+                    {
+
+                        it 'Reverse lookup matches host name' {
+                            #[System.Net.Dns]::GetHostEntry($ipaddress).HostName | should Be $fqdn
+                            #$nameHost = (Resolve-DnsName -Name $ipAddress).namehost
+                            #"$($nameHost.ToLower())" -match "^$($computerName.ToLower())" | Should Be $true
+                            "$((Resolve-DnsName -Name $ipAddress).namehost.ToLower())" | Should Be $fqdn.ToLower()
+                        }#end it reverse
+
+                    }#end if vmwarevmc
+
+                } else {
+                    it '[INFO] No IP Address provided in JSON data payload' { }
                 }
 
             }#end context real Pings
@@ -158,8 +223,6 @@ if($ICMP) {
 
             $svcType = $service.Type
             $svcFQDN = $service.FQDN
-            $svcPort = $service.Port
-            $svcApi = $service.api
 
             Context "$($svcType) $($svcFQDN)" {
 
@@ -194,10 +257,10 @@ if($vCenter)
             $dataCenter = $server.DataCenter
             $dnsDomain = $server.DNSDomain
 
-            Context "$($type) $($computerName) ($($dataCenter))" {
+            Context "$($type) $($computerName)" {
 
                 it 'PowerCli should successfully connect to vCenter' {
-                    Connect-VIServer -Server $fqdn -Credential $credMgmt | should be $true
+                    Connect-VIServer -Server $fqdn -Credential $Credential | should be $true
                 }#end it
 
                 #only perform the following tests if there is a successfully connection.
@@ -269,14 +332,31 @@ if ($vRA)
 
         foreach ($service in ($serviceList | ? { $_.type -eq "vRA" })) {
 
-            $vraType = $service.Type
-            $vraFQDN = $service.FQDN
-            $vraPort = $service.Port
-            $vraApi = $service.api
-            $vamiPort = $service.vamiPort
-            $tenant = $service.tenant
+            #Clear variables for use
             $uri = $null
             $result = $null
+            $type = $null
+            $fqdn = $null
+            $port = $null
+            $api = $null
+            $vamiPort = $null
+            $tenant = $null
+            $protocol = $null
+            
+            #Set variable values
+            $type = $service.Type
+            $fqdn = $service.FQDN
+            $port = $service.Port
+            $api = $service.api
+            $vamiPort = $service.vamiPort
+            $tenant = $service.tenant
+            $protocol = $service.Protocol
+
+            #Set protocol to https if not already defined
+            if(-not $protocol)
+            {
+                $protocol = "https"
+            }
 
             <#
             Health of vRA 
@@ -288,56 +368,65 @@ if ($vRA)
 
             Context "Web page tests" {
                 
+                if ($port) 
+                {
+                    $hostUri = "$($protocol)://$($fqdn):$($port)"
+                } else {
+                    $hostUri = "$($protocol)://$($fqdn)"
+                }#end if port
+                
                 it 'Health Status url loads without error' {
-                    $uri = "https://$($vraFQDN)$($vraApi)/vcac/services/api/status"
+                    $uri = "$($hostUri)/vcac/services/api/status"
                     $result = Invoke-WebRequest -Uri $uri
 
                     $result.StatusCode | Should Be "200"
-
                 }#end it
 
                 it 'Health Status is REGISTERED' {
-                    $uri = "https://$($vraFQDN)$($vraApi)/vcac/services/api/status"
+                    $uri = "$($hostUri)/vcac/services/api/status"
                     $result = Invoke-WebRequest -Uri $uri
 
                     ($result.Content | ConvertFrom-Json).serviceInitializationStatus | Should Be "REGISTERED"
-
                 }#end it
 
 
                 it 'VAMI Login page loads without error' {
-                    $uri = "https://$($vraFQDN):$($vamiPort)"
-                    $result = Invoke-WebRequest -Uri $uri
-
+                    $result = Invoke-WebRequest -Uri $hostUri
                     $result.StatusCode | Should Be "200"
-
-                }
+                }#end it
                 
                 it 'vRA Login GUI Page Loads without error' {
-                    $uri = "https://$($vraFQDN)/vcac"
+                    $uri = "$($hostUri)/vcac"
                     $result = Invoke-WebRequest -Uri $uri
 
                     $result.StatusCode | Should Be "200"
-
                 }#end it
 
             }#end context Web Pages
 
             Context "REST API" {
 
+                if ($port) 
+                {
+                    $hostUri = "$($protocol)://$($fqdn):$($port)"
+                } else {
+                    $hostUri = "$($protocol)://$($fqdn)"
+                }#end if port
+
+
                 #region --- generate token for vRA REST requests ------------------------------
                 #Must be outside the 'it' as this is a scope and we need to use the token in other tests
 
                 $method = "POST"
-                $uri = "https://$($vraFQDN)/identity/api/tokens"
+                $uri = "$($hostUri)/identity/api/tokens"
 
                 $headers = New-Object "System.Collections.Generic.Dictionary[[String],[String]]"
                 $headers.Add("Accept", 'application/json')
                 $headers.Add("Content-Type", 'application/json')
 
                 $body = @{
-                    username = $mgmtUsername
-                    password = $mgmtPassword
+                    username = $Username
+                    password = $Password
                     tenant = $tenant
                 } | ConvertTo-Json
 
@@ -367,7 +456,7 @@ if ($vRA)
                 #region --- Validate all configured Endpoints ---------------------------------
 
                 #Get all Endpoints
-                $uri = "https://$($vraServer)/endpoint-configuration-service/api/endpoints?limit=1000"
+                $uri = "$($hostUri)/endpoint-configuration-service/api/endpoints?limit=1000"
                 $method = "GET"
 
                 $headers = New-Object "System.Collections.Generic.Dictionary[[String],[String]]"
@@ -390,7 +479,7 @@ if ($vRA)
 
                 #uri to validate the endpoint connection
                 $method = "POST"
-                $uri = "https://$($vraServer)/endpoint-configuration-service/api/endpoints/validate"
+                $uri = "$($hostUri)/endpoint-configuration-service/api/endpoints/validate"
 
                 foreach ($endpoint in $endpointList)
                 {
@@ -435,9 +524,6 @@ if ($vRA)
 
                 }#end it
 
-                it 'others to test?' {
-
-                }#end it
 
                 it 'Infrastructure -> Compute Resource -> Compute Resource' {
                     
@@ -446,7 +532,7 @@ if ($vRA)
 
 
 
-                it 'Do a test deployment of each IaaS to each vCenter. Red Hat, 2012 R2 and 2016' {
+                it 'Do a test deployment of each template in vCenter' {
 
 
                 }#end it
@@ -479,7 +565,7 @@ if ($vRO)
     }#end if tls12
 
     #Setup REST variables
-    $base64AuthInfo = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(("{0}:{1}" -f $mgmtUsername,$mgmtPassword)))
+    $base64AuthInfo = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(("{0}:{1}" -f $Username,$Password)))
     $headers = @{"Authorization"=("Basic {0}" -f $base64AuthInfo)}
 
     $method = "GET"
@@ -488,16 +574,36 @@ if ($vRO)
 
         foreach ($service in ($serviceList | ? { $_.type -eq "vRO" })) {
 
-            $vroType = $service.Type
-            $vroFQDN = $service.FQDN
-            $vroPort = $service.Port
-            $vroApi = $service.api
+            #Clear variables
             $uri = $null
             $result = $null
+            $Type = $null
+            $fqdn = $null
+            $Port = $null
+            $Api = $null
 
-            Context "$($vroFQDN)" {
+            #Set variable values
+            $Type = $service.Type
+            $fqdn = $service.FQDN
+            $Port = $service.Port
+            $Api = $service.api
 
-                $uri = "https://$($vroFQDN)$($vroApi)/healthstatus?showDetails=false"
+            #Set protocol to https if not already defined
+            if(-not $protocol)
+            {
+                $protocol = "https"
+            }
+
+            Context "$($fqdn)" {
+
+                if ($port) 
+                {
+                    $hostUri = "$($protocol)://$($fqdn):$($port)"
+                } else {
+                    $hostUri = "$($protocol)://$($fqdn)"
+                }#end if port
+
+                $uri = "$($hostUri)$($Api)/healthstatus?showDetails=false"
                 $result = Invoke-RestMethod -Method $method -UseBasicParsing -Uri $uri -Headers $headers
 
                 it 'Status is RUNNING' {
@@ -512,14 +618,14 @@ if ($vRO)
 
 
                 it 'Retrieve list of workflows' {
-                    $uri = "https://$($vroFQDN)$($vroApi)/workflows?maxResult=2147483647&startIndex=0&queryCount=false"
+                    $uri = "$($hostUri)$($Api)/workflows?maxResult=2147483647&startIndex=0&queryCount=false"
                     
                     $result = Invoke-RestMethod -Method $method -UseBasicParsing -Uri $uri -Headers $headers
                     $result.total | Should -BeGreaterThan 1
                 }#end it
 
                 it 'Retrieve list of actions' {
-                    $uri = "https://$($vroFQDN)$($vroApi)/actions?maxResult=2147483647&startIndex=0&queryCount=false"
+                    $uri = "$($hostUri)$($Api)/actions?maxResult=2147483647&startIndex=0&queryCount=false"
                     
                     $result = Invoke-RestMethod -Method $method -UseBasicParsing -Uri $uri -Headers $headers
                     $result.total | Should -BeGreaterThan 1
@@ -543,7 +649,7 @@ if ($vRO)
                 }#end it
 
                 it 'vRO Links Page Loads without error' {
-                    $uri = "https://$($vroFQDN)/vco"
+                   $uri = "$($hostUri)/vco"
                     $result = Invoke-WebRequest -Uri $uri
 
                     $result.StatusCode | Should Be "200"
@@ -582,12 +688,34 @@ if ($vRAIaaS)
 
         foreach ($service in ($serviceList | ? { $_.type -eq "IaaSMgr" })) {
 
+            #Clear variables
+            $fqdn = $null
+            $port = $null
+            $protocol = $null
+            $healthAPI = $null
+            
+            #Set variable values
             $fqdn = "$($service.FQDN)"
+            $port = $service.port
+            $protocol = $service.protocol
             $healthAPI = "$($service.healthAPI)"
 
+            #Set protocol to https if not already defined
+            if(-not $protocol)
+            {
+                $protocol = "https"
+            }
+
             Context "Health Status" {
-                $uri = "https://$($fqdn)$($healthAPI)"
-                $result = Invoke-WebRequest -Uri $uri -Credential $CredMgmt
+                if ($port) 
+                {
+                    $hostUri = "$($protocol)://$($fqdn):$($port)"
+                } else {
+                    $hostUri = "$($protocol)://$($fqdn)"
+                }#end if port
+
+                $uri = "$($hostUri)$($healthAPI)"
+                $result = Invoke-WebRequest -Uri $uri -Credential $Credential
 
                 it 'IaaS Manager' {
                     $result.StatusCode | Should Be "200"
@@ -648,13 +776,34 @@ if ($vRAIaaS)
 
         foreach ($service in ($serviceList | ? { $_.type -eq "IaaSWeb" })) {
 
+            #Clear variables
+            $fqdn = $null
+            $port = $null
+            $protocol = $null
+            $healthAPI = $null
+            
+            #Set variable values
             $fqdn = "$($service.FQDN)"
+            $port = $service.port
+            $protocol = $service.protocol
             $healthAPI = "$($service.healthAPI)"
 
+            #Set protocol to https if not already defined
+            if(-not $protocol)
+            {
+                $protocol = "https"
+            }
+
             Context "Health Status" {
+                if ($port) 
+                {
+                    $hostUri = "$($protocol)://$($fqdn):$($port)"
+                } else {
+                    $hostUri = "$($protocol)://$($fqdn)"
+                }#end if port
 
                 it 'Health Status is registerd' {
-                    $uri = "https://$($fqdn)$($healthAPI)"
+                    $uri = "$($hostUri)$($healthAPI)"
                     $result = Invoke-WebRequest -Uri $uri
 
                     ($result.Content | ConvertFrom-Json).serviceInitializationStatus | Should Be "REGISTERED"
@@ -703,6 +852,164 @@ if ($vRAIaaS)
 #endregion --- vRA IaaS ---------------------------------------------------
 
 
+#region --- NSXT ----------------------------------------------------------
+<#
+This is a template region to be used to copy when creating new blocks of tests.
+When adding a new section, add a new switch parameter
+#>
+
+if ($NSXT)
+{
+
+    #Place any specific region setup here
+
+    Describe 'NSXT' {
+
+        foreach ($service in ($serviceList | ? { $_.type -eq "NSXT" })) {
+
+            #Clear variables for use
+            $uri = $null
+            $result = $null
+            $type = $null
+            $fqdn = $null
+            $port = $null
+            $api = $null
+            $vamiPort = $null
+            $tenant = $null
+            $protocol = $null
+            
+            #Set variable values
+            $type = $service.Type
+            $fqdn = $service.FQDN
+            $port = $service.Port
+            $api = $service.api
+            $vamiPort = $service.vamiPort
+            $tenant = $service.tenant
+            $protocol = $service.Protocol
+
+            #Set protocol to https if not already defined
+            if(-not $protocol)
+            {
+                $protocol = "https"
+            }
+
+            Context "$($fqdn)" {
+
+                if ($port) 
+                {
+                    $hostUri = "$($protocol)://$($fqdn):$($port)"
+                } else {
+                    $hostUri = "$($protocol)://$($fqdn)"
+                }#end if port
+                
+                it 'Logon page loads without error' {
+                   $uri = "$($hostUri)"
+                    $result = Invoke-WebRequest -Uri $uri
+
+                    $result.StatusCode | Should Be "200"
+
+                }#end it
+
+            }#end Context    
+
+        }#End foreach
+
+    }#end Describe
+
+} else {
+    Write-Verbose "[INFO] Skipping: NSXT"
+
+} #end if skip
+
+#endregion --- NSXT -------------------------------------------------------
+
+
+#region --- LogInsight ----------------------------------------------------------
+<#
+This is a LogInsight region to be used to copy when creating new blocks of tests.
+When adding a new section, add a new switch parameter
+#>
+
+if ($LogInsight)
+{
+
+    #Place any specific region setup here
+
+    Describe 'LogInsight Tests' {
+
+        foreach ($service in ($serviceList | ? { $_.type -eq "LogInsight" })) {
+
+            #Clear variables for use
+            $uri = $null
+            $result = $null
+            $type = $null
+            $fqdn = $null
+            $port = $null
+            $api = $null
+            $vamiPort = $null
+            $tenant = $null
+            $protocol = $null
+            $ignoreCert = $null
+            
+            #Set variable values
+            $type = $service.Type
+            $fqdn = $service.FQDN
+            $port = $service.Port
+            $api = $service.api
+            $vamiPort = $service.vamiPort
+            $tenant = $service.tenant
+            $protocol = $service.Protocol
+            $ignoreCert = $service.IgnoreCert
+
+
+            #Set protocol to https if not already defined
+            if(-not $protocol)
+            {
+                $protocol = "https"
+            }#end if protocol
+
+            Context "$($fqdn)" {
+
+                if ($port) 
+                {
+                    $hostUri = "$($protocol)://$($fqdn):$($port)"
+                } else {
+                    $hostUri = "$($protocol)://$($fqdn)"
+                }#end if port
+                
+                it 'Logon page loads without error' {
+                    $uri = "$($hostUri)"
+
+                    #If ignore certificate enable (NOT recommended)
+                    if ($ignoreCert -and $($PSVersionTable.PSVersion.Major) -lt 6)
+                    {
+                        # This sets it for the entire Powershell session, which is not ideal
+                        intSkip-CertificateCheck
+                        $result = Invoke-WebRequest -Uri $uri
+                    } elseif ($ignoreCert -and $($PSVersionTable.PSVersion.Major) -ge 6) {
+                        #not tested
+                        $result = Invoke-WebRequest -Uri $uri -SkipCertificateCheck
+                    } else {
+                        $result = Invoke-WebRequest -Uri $uri
+                    }
+
+                    $result.StatusCode | Should Be "200"
+
+                }#end it
+
+            }#end Context    
+
+        }#End foreach
+
+    }#end Describe
+
+} else {
+    Write-Verbose "[INFO] Skipping: LogInsight"
+
+} #end if skip
+
+#endregion --- LogInsight -------------------------------------------------------
+
 
 #region --- Template ----------------------------------------------------------
 <#
@@ -710,19 +1017,56 @@ This is a template region to be used to copy when creating new blocks of tests.
 When adding a new section, add a new switch parameter
 #>
 
-if ($templateType)
+if ($template)
 {
 
     #Place any specific region setup here
 
     Describe 'Template Tests' {
 
-        foreach ($service in ($serviceList | ? { $_.type -eq "vRO" })) {
+        foreach ($service in ($serviceList | ? { $_.type -eq "template" })) {
 
-            Context "Context" {
+            #Clear variables for use
+            $uri = $null
+            $result = $null
+            $type = $null
+            $fqdn = $null
+            $port = $null
+            $api = $null
+            $vamiPort = $null
+            $tenant = $null
+            $protocol = $null
+            
+            #Set variable values
+            $type = $service.Type
+            $fqdn = $service.FQDN
+            $port = $service.Port
+            $api = $service.api
+            $vamiPort = $service.vamiPort
+            $tenant = $service.tenant
+            $protocol = $service.Protocol
+
+            #Set protocol to https if not already defined
+            if(-not $protocol)
+            {
+                $protocol = "https"
+            }#end if protocol
+
+            Context "$($fqdn)" {
+
+                if ($port) 
+                {
+                    $hostUri = "$($protocol)://$($fqdn):$($port)"
+                } else {
+                    $hostUri = "$($protocol)://$($fqdn)"
+                }#end if port
                 
-                it 'Template Test should be true' {
-                    $true | Should Be $true
+                it 'Logon page loads without error' {
+                    $uri = "$($hostUri)/template"
+                    $result = Invoke-WebRequest -Uri $uri
+
+                    $result.StatusCode | Should Be "200"
+
                 }#end it
 
             }#end Context    
