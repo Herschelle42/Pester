@@ -50,7 +50,7 @@ Param
     [Parameter(Mandatory=$true)]
     [string]$JSONPayload,
     [Parameter(Mandatory=$false)]
-    [switch]$ICMP=$true,
+    [switch]$ICMP=$false,
     [Parameter(Mandatory=$false)]
     [switch]$vCenter=$false,
     [Parameter(Mandatory=$false)]
@@ -391,7 +391,7 @@ if ($vRA)
 
 
                 it 'VAMI Login page loads without error' {
-                    $result = Invoke-WebRequest -Uri $hostUri
+                    $result = Invoke-WebRequest -Uri "$($protocol)://$($fqdn):$($vamiPort)"
                     $result.StatusCode | Should Be "200"
                 }#end it
                 
