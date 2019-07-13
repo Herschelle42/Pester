@@ -85,6 +85,22 @@ $jsonData = @"
             "healthAPI": "/VMPS2"
         },
         {
+            "Type": "IaaSMgr",
+            "FQDN": "vra-mgr-prd.management.corp.local",
+            "Port": "",
+            "Protocol": "https",
+            "api": "",
+            "healthAPI": "/VMPSProvision"
+        },
+        {
+            "Type": "IaaSMgr",
+            "FQDN": "vra-mgr-prd.management.corp.local",
+            "Port": "",
+            "Protocol": "https",
+            "api": "",
+            "healthAPI": "/VMPS2Proxy"
+        },
+        {
             "Type": "IaaSWeb",
             "FQDN": "vra-web-prd.management.corp.local",
             "Port": "",

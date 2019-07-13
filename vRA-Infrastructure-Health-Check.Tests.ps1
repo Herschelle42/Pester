@@ -766,6 +766,7 @@ if ($vRAIaaS)
 
     #Requires authentication
     repository:  /Repository/Data/MetaModel.svc
+    repository:  /Repository/Data/MetaModel.svc/DEMs
     #>
 
 
@@ -910,7 +911,15 @@ if ($NSXT)
 
                 }#end it
 
-            }#end Context    
+            }#end Context
+
+            <#
+            For Edge Node status, get the edge node id first:
+            'https://nsxmgr-01a.corp.local/api/v1/transport-nodes?node_types=EdgeNode'
+
+            Then get the status of the edge node:
+            'https://nsxmgr-01a.corp.local/api/v1/transport-nodes/321e018e-97ac-11e9-b7f3-005056a3e406/status'
+            #>
 
         }#End foreach
 
